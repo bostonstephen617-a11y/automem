@@ -82,19 +82,37 @@ def _load_embedding(raw: Any) -> Optional[List[float]]:
 
 def _cosine_similarity(vec1: Sequence[float], vec2: Sequence[float]) -> float:
     """Compute cosine similarity between two vectors."""
-
+    
     if len(vec1) != len(vec2):
         return 0.0
 
-    dot_product = sum(a * b for a, b in zip(vec1, vec2))
-    norm_a = math.sqrt(sum(a * a for a in vec1))
-    norm_b = math.sqrt(sum(b * b for b in vec2))
+    # Try numpy for large vectors (faster)
+    try:
+        import numpy as np
+        arr1 = np.asarray(vec1, dtype=np.float32)
+        arr2 = np.asarray(vec2, dtype=np.float32)
+        
+        dot = np.dot(arr1, arr2)
+        norm1 = np.linalg.norm(arr1)
+        norm2 = np.linalg.norm(arr2)
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        similarity = float(dot / (norm1 * norm2))
+        return max(-1.0, min(1.0, similarity))
+        
+    except (ImportError, ValueError, RuntimeError):
+        # Fallback to pure Python for small vectors or if numpy unavailable
+        dot_product = sum(a * b for a, b in zip(vec1, vec2))
+        norm_a = math.sqrt(sum(a * a for a in vec1))
+        norm_b = math.sqrt(sum(b * b for b in vec2))
 
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
 
-    similarity = dot_product / (norm_a * norm_b)
-    return max(-1.0, min(1.0, similarity))
+        similarity = dot_product / (norm_a * norm_b)
+        return max(-1.0, min(1.0, similarity))
 
 
 class MemoryConsolidator:
