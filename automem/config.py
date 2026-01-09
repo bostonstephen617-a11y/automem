@@ -36,8 +36,9 @@ CONSOLIDATION_DECAY_IMPORTANCE_THRESHOLD = (
 CONSOLIDATION_HISTORY_LIMIT = int(os.getenv("CONSOLIDATION_HISTORY_LIMIT", "20"))
 
 # Memory protection configuration (prevents accidental data loss)
-CONSOLIDATION_DELETE_THRESHOLD = float(os.getenv("CONSOLIDATION_DELETE_THRESHOLD", "0.0"))
-CONSOLIDATION_ARCHIVE_THRESHOLD = float(os.getenv("CONSOLIDATION_ARCHIVE_THRESHOLD", "0.0"))
+# Note: Changed defaults to be more conservative and prevent accidental data loss
+CONSOLIDATION_DELETE_THRESHOLD = float(os.getenv("CONSOLIDATION_DELETE_THRESHOLD", "0.05"))  # Was 0.0
+CONSOLIDATION_ARCHIVE_THRESHOLD = float(os.getenv("CONSOLIDATION_ARCHIVE_THRESHOLD", "0.10"))  # Was 0.0
 CONSOLIDATION_GRACE_PERIOD_DAYS = int(os.getenv("CONSOLIDATION_GRACE_PERIOD_DAYS", "90"))
 CONSOLIDATION_IMPORTANCE_PROTECTION_THRESHOLD = float(
     os.getenv("CONSOLIDATION_IMPORTANCE_PROTECTION_THRESHOLD", "0.7")
@@ -48,6 +49,39 @@ CONSOLIDATION_PROTECTED_TYPES = (
     if _PROTECTED_TYPES_RAW
     else frozenset()
 )
+
+# Validate protection configuration to prevent dangerous settings
+def _validate_protection_config():
+    """Validate that protection configuration is safe and logical."""
+    errors = []
+    
+    # Check that thresholds are in valid ranges
+    if not (0.0 <= CONSOLIDATION_DELETE_THRESHOLD <= 0.5):
+        errors.append(f"CONSOLIDATION_DELETE_THRESHOLD ({CONSOLIDATION_DELETE_THRESHOLD}) must be between 0.0 and 0.5")
+    
+    if not (0.0 <= CONSOLIDATION_ARCHIVE_THRESHOLD <= 0.5):
+        errors.append(f"CONSOLIDATION_ARCHIVE_THRESHOLD ({CONSOLIDATION_ARCHIVE_THRESHOLD}) must be between 0.0 and 0.5")
+    
+    # Archive threshold should be higher than delete threshold
+    if CONSOLIDATION_ARCHIVE_THRESHOLD <= CONSOLIDATION_DELETE_THRESHOLD:
+        errors.append(f"CONSOLIDATION_ARCHIVE_THRESHOLD ({CONSOLIDATION_ARCHIVE_THRESHOLD}) must be greater than CONSOLIDATION_DELETE_THRESHOLD ({CONSOLIDATION_DELETE_THRESHOLD})")
+    
+    # Grace period should be reasonable
+    if not (0 <= CONSOLIDATION_GRACE_PERIOD_DAYS <= 365):
+        errors.append(f"CONSOLIDATION_GRACE_PERIOD_DAYS ({CONSOLIDATION_GRACE_PERIOD_DAYS}) must be between 0 and 365")
+    
+    # Importance protection threshold should be reasonable
+    if not (0.5 <= CONSOLIDATION_IMPORTANCE_PROTECTION_THRESHOLD <= 1.0):
+        errors.append(f"CONSOLIDATION_IMPORTANCE_PROTECTION_THRESHOLD ({CONSOLIDATION_IMPORTANCE_PROTECTION_THRESHOLD}) must be between 0.5 and 1.0")
+    
+    # Check that protected types are valid
+    invalid_types = set(CONSOLIDATION_PROTECTED_TYPES) - MEMORY_TYPES
+    if invalid_types:
+        errors.append(f"Invalid protected types: {invalid_types}. Valid types are: {MEMORY_TYPES}")
+    
+    if errors:
+        raise ValueError("Invalid protection configuration: " + "; ".join(errors))
+
 CONSOLIDATION_CONTROL_LABEL = "ConsolidationControl"
 CONSOLIDATION_RUN_LABEL = "ConsolidationRun"
 CONSOLIDATION_CONTROL_NODE_ID = os.getenv("CONSOLIDATION_CONTROL_NODE_ID", "global")
@@ -213,3 +247,6 @@ SEARCH_WEIGHT_RELATION = float(os.getenv("SEARCH_WEIGHT_RELATION", "0.25"))
 # API tokens
 API_TOKEN = os.getenv("AUTOMEM_API_TOKEN")
 ADMIN_TOKEN = os.getenv("ADMIN_API_TOKEN")
+
+# Run validation when module is imported (after all dependencies are defined)
+_validate_protection_config()

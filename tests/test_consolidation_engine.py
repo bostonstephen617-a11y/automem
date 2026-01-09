@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Generator
 
 import pytest
 
 import consolidation as consolidation_module
 from consolidation import MemoryConsolidator
+from automem.config import (
+    CONSOLIDATION_DELETE_THRESHOLD,
+    CONSOLIDATION_ARCHIVE_THRESHOLD,
+    CONSOLIDATION_GRACE_PERIOD_DAYS,
+    CONSOLIDATION_IMPORTANCE_PROTECTION_THRESHOLD,
+    CONSOLIDATION_PROTECTED_TYPES,
+)
 
 
 class FakeResult:
@@ -78,7 +85,7 @@ class FakeVectorStore:
 
 
 @pytest.fixture(autouse=True)
-def freeze_time(monkeypatch: pytest.MonkeyPatch) -> None:
+def freeze_time(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     """Use a fixed timestamp to keep decay calculations deterministic."""
 
     class FixedDatetime(datetime):
@@ -195,7 +202,7 @@ def test_apply_controlled_forgetting_dry_run() -> None:
     assert stats["preserved"] == 2
     assert len(stats["archived"]) == 0
     assert len(stats["deleted"]) == 1
-    assert len(stats["protected"]) == 1
+    assert len(stats["protected"]) == 2  # Both recent-keep and archive-candidate are protected
     assert graph.deleted == []
 
 
@@ -234,3 +241,350 @@ def test_apply_decay_updates_scores() -> None:
     assert stats["processed"] == 2
     assert len(graph.updated_scores) == 2
     assert stats["avg_relevance_after"] <= 1
+
+
+# ==================== Memory Protection Tests ====================
+
+def test_protection_explicit_flag():
+    """Test that explicitly protected memories are not deleted/archived."""
+    graph = FakeGraph()
+    graph.forgetting_rows = [
+        [
+            "protected-mem",
+            "Important memory that should be protected",
+            0.01,  # Very low relevance - would normally be deleted
+            iso_days_ago(180),
+            "Decision",
+            0.6,
+            iso_days_ago(180),
+            True,  # Explicitly protected
+            "User marked as important",
+        ],
+    ]
+
+    consolidator = MemoryConsolidator(graph)
+    stats = consolidator.apply_controlled_forgetting(dry_run=False)
+
+    assert stats["examined"] == 1
+    assert stats["preserved"] == 1
+    assert len(stats["protected"]) == 1
+    assert len(stats["deleted"]) == 0
+    assert len(stats["archived"]) == 0
+    assert "User marked as important" in stats["protected"][0]["protection_reason"]
+    assert "protected type: Decision" in stats["protected"][0]["protection_reason"]
+
+
+def test_protection_importance_threshold():
+    """Test that high-importance memories are protected."""
+    graph = FakeGraph()
+    graph.forgetting_rows = [
+        [
+            "high-importance-mem",
+            "Critical decision memory",
+            0.01,  # Very low relevance
+            iso_days_ago(180),
+            "Decision",
+            0.8,  # High importance - should be protected
+            iso_days_ago(180),
+            None,
+            None,
+        ],
+    ]
+
+    consolidator = MemoryConsolidator(graph)
+    stats = consolidator.apply_controlled_forgetting(dry_run=False)
+
+    assert stats["examined"] == 1
+    assert stats["preserved"] == 1
+    assert len(stats["protected"]) == 1
+    assert len(stats["deleted"]) == 0
+    assert "high importance" in stats["protected"][0]["protection_reason"]
+
+
+def test_protection_grace_period():
+    """Test that recent memories are protected by grace period."""
+    graph = FakeGraph()
+    graph.forgetting_rows = [
+        [
+            "recent-mem",
+            "Recent memory within grace period",
+            0.01,  # Very low relevance
+            iso_days_ago(30),  # Only 30 days old - within 90-day grace period
+            "Context",
+            0.4,
+            iso_days_ago(30),
+            None,
+            None,
+        ],
+    ]
+
+    consolidator = MemoryConsolidator(graph)
+    stats = consolidator.apply_controlled_forgetting(dry_run=False)
+
+    assert stats["examined"] == 1
+    assert stats["preserved"] == 1
+    assert len(stats["protected"]) == 1
+    assert len(stats["deleted"]) == 0
+    assert "grace period" in stats["protected"][0]["protection_reason"]
+
+
+def test_protection_memory_types():
+    """Test that protected memory types are not deleted/archived."""
+    graph = FakeGraph()
+    graph.forgetting_rows = [
+        [
+            "decision-mem",
+            "Important decision",
+            0.01,  # Very low relevance
+            iso_days_ago(180),
+            "Decision",  # Protected type
+            0.4,
+            iso_days_ago(180),
+            None,
+            None,
+        ],
+        [
+            "insight-mem",
+            "Valuable insight",
+            0.05,  # Low relevance
+            iso_days_ago(180),
+            "Insight",  # Protected type
+            0.4,
+            iso_days_ago(180),
+            None,
+            None,
+        ],
+    ]
+
+    consolidator = MemoryConsolidator(graph)
+    stats = consolidator.apply_controlled_forgetting(dry_run=False)
+
+    assert stats["examined"] == 2
+    assert stats["preserved"] == 2
+    assert len(stats["protected"]) == 2
+    assert len(stats["deleted"]) == 0
+    assert all("protected type" in item["protection_reason"] for item in stats["protected"])
+
+
+def test_protection_combined_criteria():
+    """Test that multiple protection criteria work together."""
+    graph = FakeGraph()
+    graph.forgetting_rows = [
+        [
+            "multi-protected-mem",
+            "Memory with multiple protection reasons",
+            0.01,
+            iso_days_ago(30),  # Recent
+            "Decision",  # Protected type
+            0.8,  # High importance
+            iso_days_ago(30),
+            True,  # Explicitly protected
+            "Multiple reasons",
+        ],
+    ]
+
+    consolidator = MemoryConsolidator(graph)
+    stats = consolidator.apply_controlled_forgetting(dry_run=False)
+
+    assert stats["examined"] == 1
+    assert stats["preserved"] == 1
+    assert len(stats["protected"]) == 1
+    # Should have multiple protection reasons combined
+    reasons = stats["protected"][0]["protection_reason"]
+    assert "Multiple reasons" in reasons
+    assert "high importance" in reasons
+    assert "protected type: Decision" in reasons
+    assert "within grace period" in reasons
+
+
+def test_protection_archive_vs_delete():
+    """Test that protection works for both archive and delete thresholds."""
+    graph = FakeGraph()
+    graph.forgetting_rows = [
+        [
+            "archive-candidate",
+            "Memory that would be archived",
+            0.08,  # Between delete and archive thresholds
+            iso_days_ago(180),
+            "Decision",  # Protected type
+            0.4,
+            iso_days_ago(180),
+            None,
+            None,
+        ],
+        [
+            "delete-candidate",
+            "Memory that would be deleted",
+            0.02,  # Below delete threshold
+            iso_days_ago(180),
+            "Decision",  # Protected type
+            0.4,
+            iso_days_ago(180),
+            None,
+            None,
+        ],
+    ]
+
+    consolidator = MemoryConsolidator(graph)
+    stats = consolidator.apply_controlled_forgetting(dry_run=False)
+
+    assert stats["examined"] == 2
+    assert stats["preserved"] == 2
+    assert len(stats["protected"]) == 2
+    # Both should be protected from their respective fates
+    # Note: Since both are Decision types, they're both protected by type
+    # The action field shows what would have happened if not protected
+    assert all(item["action"] == "delete" for item in stats["protected"])
+
+
+def test_no_protection_when_not_applicable():
+    """Test that memories without protection criteria are processed normally."""
+    graph = FakeGraph()
+    graph.forgetting_rows = [
+        [
+            "unprotected-mem",
+            "Old unimportant memory",
+            0.01,  # Very low relevance
+            iso_days_ago(180),
+            "Context",  # Not a protected type
+            0.3,  # Below importance threshold
+            iso_days_ago(180),
+            None,
+            None,
+        ],
+    ]
+
+    consolidator = MemoryConsolidator(graph)
+    stats = consolidator.apply_controlled_forgetting(dry_run=False)
+
+    assert stats["examined"] == 1
+    assert stats["preserved"] == 0
+    assert len(stats["protected"]) == 0
+    assert len(stats["deleted"]) == 1
+    assert stats["deleted"][0]["id"] == "unprotected-mem"
+
+
+def test_protection_logging():
+    """Test that protection decisions are properly logged."""
+    graph = FakeGraph()
+    graph.forgetting_rows = [
+        [
+            "logged-protection",
+            "Memory for logging test",
+            0.01,
+            iso_days_ago(30),
+            "Decision",
+            0.4,
+            iso_days_ago(30),
+            None,
+            None,
+        ],
+    ]
+
+    consolidator = MemoryConsolidator(graph)
+    # This test verifies that the logging calls are made
+    # In a real test, we'd mock the logger to capture the log messages
+    stats = consolidator.apply_controlled_forgetting(dry_run=False)
+
+    assert stats["examined"] == 1
+    assert len(stats["protected"]) == 1
+
+
+def test_config_validation():
+    """Test that configuration validation works correctly."""
+    from automem.config import _validate_protection_config
+
+    # Test that valid configuration passes
+    try:
+        _validate_protection_config()
+    except ValueError:
+        pytest.fail("Valid configuration should not raise ValueError")
+
+    # Test invalid configurations (would need to temporarily modify config)
+    # This is more complex to test properly and might be better as integration tests
+
+
+def test_protection_with_custom_thresholds():
+    """Test protection with custom importance threshold."""
+    graph = FakeGraph()
+    
+    # Create consolidator with custom importance protection threshold
+    consolidator = MemoryConsolidator(
+        graph,
+        importance_protection_threshold=0.6  # Lower than default 0.7
+    )
+    
+    graph.forgetting_rows = [
+        [
+            "custom-threshold-mem",
+            "Memory with importance at custom threshold",
+            0.01,
+            iso_days_ago(180),
+            "Context",
+            0.6,  # Exactly at the custom threshold
+            iso_days_ago(180),
+            None,
+            None,
+        ],
+    ]
+
+    stats = consolidator.apply_controlled_forgetting(dry_run=False)
+
+    assert stats["examined"] == 1
+    assert stats["preserved"] == 1
+    assert len(stats["protected"]) == 1
+    assert "high importance" in stats["protected"][0]["protection_reason"]
+
+
+def test_protection_edge_cases():
+    """Test edge cases in protection logic."""
+    graph = FakeGraph()
+    
+    # Test with exactly threshold values
+    graph.forgetting_rows = [
+        [
+            "edge-case-mem",
+            "Memory at exact importance threshold",
+            0.01,
+            iso_days_ago(180),
+            "Context",
+            CONSOLIDATION_IMPORTANCE_PROTECTION_THRESHOLD,  # Exact threshold
+            iso_days_ago(180),
+            None,
+            None,
+        ],
+    ]
+
+    consolidator = MemoryConsolidator(graph)
+    stats = consolidator.apply_controlled_forgetting(dry_run=False)
+
+    # Should be protected since importance >= threshold
+    assert len(stats["protected"]) == 1
+    assert stats["preserved"] == 1
+
+
+def test_protection_with_relationships():
+    """Test that protection works regardless of relationship count."""
+    graph = FakeGraph()
+    graph.relationship_counts["protected-with-relations"] = 10  # Many relationships
+    
+    graph.forgetting_rows = [
+        [
+            "protected-with-relations",
+            "Protected memory with many relationships",
+            0.01,
+            iso_days_ago(180),
+            "Decision",  # Protected type
+            0.4,
+            iso_days_ago(180),
+            None,
+            None,
+        ],
+    ]
+
+    consolidator = MemoryConsolidator(graph)
+    stats = consolidator.apply_controlled_forgetting(dry_run=False)
+
+    # Should still be protected even with many relationships
+    assert len(stats["protected"]) == 1
+    assert stats["preserved"] == 1

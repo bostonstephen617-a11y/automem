@@ -243,13 +243,19 @@ class MemoryConsolidator:
         current_time: datetime,
     ) -> tuple[bool, str]:
         """Return whether a memory should be protected from archiving/deletion."""
+        memory_id = memory.get("id", "unknown")
+        protection_reasons = []
+
+        # Check 1: Explicit protection flag
         protected_flag = memory.get("protected")
         if isinstance(protected_flag, str):
             protected_flag = protected_flag.strip().lower() not in {"", "0", "false", "no"}
         if protected_flag:
             reason = memory.get("protected_reason") or "explicitly protected"
-            return True, str(reason)
+            protection_reasons.append(str(reason))
+            logger.info(f"Memory {memory_id} protected: {reason}")
 
+        # Check 2: Importance threshold
         importance_raw = memory.get("importance")
         if importance_raw is None:
             importance = 0.5
@@ -260,22 +266,31 @@ class MemoryConsolidator:
                 importance = 0.5
 
         if importance >= self.importance_protection_threshold:
-            return (
-                True,
-                f"high importance ({importance:.2f} >= {self.importance_protection_threshold})",
-            )
+            reason = f"high importance ({importance:.2f} >= {self.importance_protection_threshold})"
+            protection_reasons.append(reason)
+            logger.info(f"Memory {memory_id} protected: {reason}")
 
+        # Check 3: Grace period
         timestamp_str = memory.get("timestamp")
         if timestamp_str:
             created_at = _parse_iso_datetime(timestamp_str)
             if created_at:
                 age_days = (current_time - created_at).days
                 if age_days < self.grace_period_days:
-                    return True, f"within grace period ({age_days} < {self.grace_period_days} days)"
+                    reason = f"within grace period ({age_days} < {self.grace_period_days} days)"
+                    protection_reasons.append(reason)
+                    logger.info(f"Memory {memory_id} protected: {reason}")
 
+        # Check 4: Protected memory types
         memory_type = memory.get("type")
         if memory_type and str(memory_type) in self.protected_types:
-            return True, f"protected type: {memory_type}"
+            reason = f"protected type: {memory_type}"
+            protection_reasons.append(reason)
+            logger.info(f"Memory {memory_id} protected: {reason}")
+
+        if protection_reasons:
+            combined_reason = "; ".join(protection_reasons)
+            return True, combined_reason
 
         return False, ""
 
@@ -521,28 +536,30 @@ class MemoryConsolidator:
             relevance = self.calculate_relevance_score(memory, current_time)
             should_protect, protection_reason = self._should_protect_memory(memory, current_time)
 
-            # Determine fate
-            if relevance < self.delete_threshold:
-                if should_protect:
-                    stats["protected"].append(
-                        {
-                            "id": memory["id"],
-                            "content_preview": (memory["content"] or "")[:50],
-                            "relevance": relevance,
-                            "type": memory.get("type", "Memory"),
-                            "protection_reason": protection_reason,
-                            "action": "delete",
-                        }
-                    )
-                    stats["preserved"] += 1
-                    if not dry_run:
-                        update_query = """
-                            MATCH (m:Memory {id: $id})
-                            SET m.relevance_score = $score
-                        """
-                        self._query_graph(update_query, {"id": memory["id"], "score": relevance})
-                    continue
+            # Determine fate with consistent protection application
+            if should_protect:
+                stats["protected"].append(
+                    {
+                        "id": memory["id"],
+                        "content_preview": (memory["content"] or "")[:50],
+                        "relevance": relevance,
+                        "type": memory.get("type", "Memory"),
+                        "protection_reason": protection_reason,
+                        "action": "delete" if relevance < self.delete_threshold else "archive",
+                    }
+                )
+                stats["preserved"] += 1
+                if not dry_run:
+                    update_query = """
+                        MATCH (m:Memory {id: $id})
+                        SET m.relevance_score = $score
+                    """
+                    self._query_graph(update_query, {"id": memory["id"], "score": relevance})
+                logger.info(f"Memory {memory['id']} protected from {'deletion' if relevance < self.delete_threshold else 'archival'}: {protection_reason}")
+                continue
 
+            # Apply deletion/archival only if not protected
+            if relevance < self.delete_threshold:
                 stats["deleted"].append(
                     {
                         "id": memory["id"],
@@ -559,6 +576,7 @@ class MemoryConsolidator:
                         DETACH DELETE m
                     """
                     self._query_graph(delete_query, {"id": memory["id"]})
+                    logger.info(f"Memory {memory['id']} deleted (relevance: {relevance:.3f})")
 
                     # Delete from vector store if present
                     if self.vector_store:
@@ -572,30 +590,11 @@ class MemoryConsolidator:
                                 collection_name="memories",
                                 points_selector=selector,
                             )
+                            logger.info(f"Memory {memory['id']} removed from vector store")
                         except Exception:
                             logger.exception("Vector store deletion failed for %s", memory["id"])
 
             elif relevance < self.archive_threshold:
-                if should_protect:
-                    stats["protected"].append(
-                        {
-                            "id": memory["id"],
-                            "content_preview": (memory["content"] or "")[:50],
-                            "relevance": relevance,
-                            "type": memory.get("type", "Memory"),
-                            "protection_reason": protection_reason,
-                            "action": "archive",
-                        }
-                    )
-                    stats["preserved"] += 1
-                    if not dry_run:
-                        update_query = """
-                            MATCH (m:Memory {id: $id})
-                            SET m.relevance_score = $score
-                        """
-                        self._query_graph(update_query, {"id": memory["id"], "score": relevance})
-                    continue
-
                 stats["archived"].append(
                     {
                         "id": memory["id"],
@@ -621,6 +620,7 @@ class MemoryConsolidator:
                             "score": relevance,
                         },
                     )
+                    logger.info(f"Memory {memory['id']} archived (relevance: {relevance:.3f})")
             else:
                 stats["preserved"] += 1
 
@@ -631,6 +631,7 @@ class MemoryConsolidator:
                         SET m.relevance_score = $score
                     """
                     self._query_graph(update_query, {"id": memory["id"], "score": relevance})
+                    logger.debug(f"Memory {memory['id']} relevance updated to {relevance:.3f}")
 
         if stats["protected"]:
             logger.info(

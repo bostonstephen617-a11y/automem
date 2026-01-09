@@ -11,6 +11,30 @@ from flask import Blueprint, abort, jsonify, request
 from automem.config import ALLOWED_RELATIONS, RECALL_EXPANSION_LIMIT, RECALL_RELATION_LIMIT
 from automem.utils.graph import _serialize_node
 
+
+def _normalize_silo_id(model_name: Optional[str]) -> str:
+    """
+    Normalize model name to valid silo ID.
+    Matches the logic in functions/silo_utils.py
+    """
+    if not model_name:
+        return "default_model"
+    
+    clean_name = str(model_name).strip()
+    clean_name = clean_name.split('/')[-1].split('\\')[-1]
+    clean_name = re.sub(r"\.(gguf|bin|hf)$", "", clean_name, flags=re.IGNORECASE)
+    clean_name = clean_name.lower()
+    clean_name = re.sub(r"[^a-zA-Z0-9_-]", "_", clean_name)
+    clean_name = clean_name.replace("-", "_")
+    clean_name = clean_name.strip("_")
+    clean_name = clean_name[:50]
+    
+    if not clean_name or not clean_name[0].isalnum():
+        clean_name = "model_" + clean_name.lstrip("_")
+    
+    return clean_name.strip("_")
+
+
 DEFAULT_STYLE_PRIORITY_TAGS: Set[str] = {
     "coding-style",
     "style",

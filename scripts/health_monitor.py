@@ -16,6 +16,8 @@ import logging
 import os
 import sys
 import time
+import psutil
+import platform
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -66,6 +68,40 @@ class HealthMonitor:
 
         self.last_check: Dict[str, Any] = {}
         self.last_alert_time: Optional[datetime] = None
+        # Resource monitoring thresholds
+        self.cpu_threshold = float(os.getenv("CPU_USAGE_THRESHOLD", "60.0"))
+        self.memory_threshold = float(os.getenv("MEMORY_USAGE_THRESHOLD", "90.0"))
+        self.load_threshold = float(os.getenv("SYSTEM_LOAD_THRESHOLD", "1.5"))
+    
+    def is_system_busy(self) -> bool:
+        """
+        Check if the system is too busy for background tasks.
+        Returns True if we should back off.
+        """
+        try:
+            # Check CPU
+            cpu = psutil.cpu_percent(interval=1)
+            if cpu > self.cpu_threshold:
+                logger.info(f"System busy (CPU {cpu}% > {self.cpu_threshold}%) - Yielding...")
+                return True
+
+            # Check Memory
+            mem = psutil.virtual_memory().percent
+            if mem > self.memory_threshold:
+                logger.info(f"System busy (RAM {mem}% > {self.memory_threshold}%) - Yielding...")
+                return True
+
+            # Check Load (Linux/Mac only)
+            if platform.system() in ["Linux", "Darwin"]:
+                load = os.getloadavg()[0]
+                if load > self.load_threshold:
+                    logger.info(f"System busy (Load {load}) - Yielding...")
+                    return True
+                
+            return False
+        except Exception as e:
+            logger.error(f"Monitor error: {e}")
+            return False
 
     def check_falkordb(self) -> Dict[str, Any]:
         """Check FalkorDB connection and memory count."""
@@ -342,9 +378,16 @@ class HealthMonitor:
         logger.info(f"   Critical threshold: {self.critical_threshold_percent}%")
         if self.alert_webhook:
             logger.info(f"   Webhook alerts: {self.alert_webhook}")
+        logger.info(f"   Resource thresholds: CPU>{self.cpu_threshold}%, RAM>{self.memory_threshold}%, Load>{self.load_threshold}")
 
         while True:
             try:
+                # Check if system is busy before running health check
+                if self.is_system_busy():
+                    # If system is busy, use shorter sleep and check more frequently
+                    time.sleep(60)
+                    continue
+                
                 self.run_check()
             except Exception as e:
                 logger.error(f"Health check failed: {e}")

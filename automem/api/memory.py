@@ -1,11 +1,35 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from flask import Blueprint, abort, jsonify, request
+
+
+def _normalize_silo_id(model_name: Optional[str]) -> str:
+    """
+    Normalize model name to valid silo ID.
+    Matches the logic in functions/silo_utils.py
+    """
+    if not model_name:
+        return "default_model"
+    
+    clean_name = str(model_name).strip()
+    clean_name = clean_name.split('/')[-1].split('\\')[-1]
+    clean_name = re.sub(r"\.(gguf|bin|hf)$", "", clean_name, flags=re.IGNORECASE)
+    clean_name = clean_name.lower()
+    clean_name = re.sub(r"[^a-zA-Z0-9_-]", "_", clean_name)
+    clean_name = clean_name.replace("-", "_")
+    clean_name = clean_name.strip("_")
+    clean_name = clean_name[:50]
+    
+    if not clean_name or not clean_name[0].isalnum():
+        clean_name = "model_" + clean_name.lstrip("_")
+    
+    return clean_name.strip("_")
 
 
 def create_memory_blueprint(
@@ -82,7 +106,6 @@ def create_memory_blueprint_full(
         tags_lower = [t.strip().lower() for t in tags if isinstance(t, str) and t.strip()]
         tag_prefixes = compute_tag_prefixes(tags_lower)
         importance = coerce_importance(payload.get("importance"))
-        # Always generate server-side UUID to prevent collision/overwrite attacks
         memory_id = str(uuid.uuid4())
 
         metadata_raw = payload.get("metadata")
@@ -94,12 +117,9 @@ def create_memory_blueprint_full(
             abort(400, description="'metadata' must be an object")
         metadata_json = json.dumps(metadata, default=str)
 
-        # Accept explicit type/confidence or classify automatically
         memory_type = payload.get("type")
         type_confidence = payload.get("confidence")
         if memory_type:
-            # Validate explicit type
-            # (Memory types are validated by the classifier caller; keep permissive here)
             if type_confidence is None:
                 type_confidence = 0.9
             else:
@@ -156,24 +176,19 @@ def create_memory_blueprint_full(
         else:
             last_accessed = updated_at
 
+        # Handle silo_id from payload, headers, or query params
+        silo_id = payload.get("silo_id") or payload.get("user_id")
+        if not silo_id:
+            silo_id = request.headers.get("X-User-ID") or request.headers.get("X-Model-Name")
+        if silo_id:
+            silo_id = _normalize_silo_id(silo_id)
+        else:
+            silo_id = "default_model"
+
         try:
             graph.query(
                 """
                 MERGE (m:Memory {id: $id})
-                ON CREATE SET
-                    m.content = $content,
-                    m.timestamp = $timestamp,
-                    m.importance = $importance,
-                    m.tags = $tags,
-                    m.tag_prefixes = $tag_prefixes,
-                    m.type = $type,
-                    m.confidence = $confidence,
-                    m.t_valid = $t_valid,
-                    m.t_invalid = $t_invalid,
-                    m.updated_at = $updated_at,
-                    m.last_accessed = $last_accessed,
-                    m.metadata = $metadata,
-                    m.processed = false
                 SET m.content = $content,
                     m.timestamp = $timestamp,
                     m.importance = $importance,
@@ -186,6 +201,7 @@ def create_memory_blueprint_full(
                     m.updated_at = $updated_at,
                     m.last_accessed = $last_accessed,
                     m.metadata = $metadata,
+                    m.silo_id = $silo_id,
                     m.processed = false
                 RETURN m
                 """,
@@ -203,16 +219,15 @@ def create_memory_blueprint_full(
                     "updated_at": updated_at,
                     "last_accessed": last_accessed,
                     "metadata": metadata_json,
+                    "silo_id": silo_id,
                 },
             )
         except Exception:
             logger.exception("Failed to persist memory in FalkorDB")
             abort(500, description="Failed to store memory in FalkorDB")
 
-        # Queue enrichment
         enqueue_enrichment(memory_id)
 
-        # Handle embeddings
         embedding_status = "skipped"
         qdrant_client = get_qdrant_client()
         if embedding is not None:
@@ -237,6 +252,7 @@ def create_memory_blueprint_full(
                                     "updated_at": updated_at,
                                     "last_accessed": last_accessed,
                                     "metadata": metadata,
+                                    "silo_id": silo_id,
                                 },
                             )
                         ],
@@ -256,32 +272,111 @@ def create_memory_blueprint_full(
             "status": "success",
             "memory_id": memory_id,
             "stored_at": created_at,
+            "silo": silo_id,
             "type": memory_type,
             "confidence": type_confidence,
             "qdrant": qdrant_result,
             "embedding_status": embedding_status,
             "enrichment": "queued" if state.enrichment_queue else "disabled",
             "metadata": metadata,
-            "timestamp": created_at,
-            "updated_at": updated_at,
-            "last_accessed": last_accessed,
             "query_time_ms": round((time.perf_counter() - query_start) * 1000, 2),
         }
         logger.info(
             "memory_stored",
             extra={
                 "memory_id": memory_id,
+                "silo_id": silo_id,
                 "type": memory_type,
                 "importance": importance,
-                "tags_count": len(tags),
-                "content_length": len(content),
                 "latency_ms": response["query_time_ms"],
-                "embedding_status": embedding_status,
-                "qdrant_status": qdrant_result,
-                "enrichment_queued": bool(state.enrichment_queue),
             },
         )
         return jsonify(response), 201
+
+    @bp.route("/memory/model", methods=["POST"])
+    def store_in_silo() -> Any:
+        """
+        Store memory in a specific model silo.
+        
+        Query params:
+            - model_name: The model name to use as silo ID (e.g., "llama3.gguf")
+        
+        Headers:
+            - X-Model-Name: Model name for silo
+            - X-User-ID: User ID for silo (takes precedence)
+        
+        JSON body:
+            - All standard memory fields (content, importance, tags, etc.)
+            - silo_id/user_id: Optional override for silo ID
+        """
+        model_name = request.args.get("model_name") or request.headers.get("X-Model-Name")
+        user_id = request.args.get("user_id") or request.headers.get("X-User-ID")
+        
+        if user_id:
+            silo_id = _normalize_silo_id(user_id)
+        elif model_name:
+            silo_id = _normalize_silo_id(model_name)
+        else:
+            silo_id = "default_model"
+        
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            abort(400, description="JSON body is required")
+        
+        payload["silo_id"] = silo_id
+        
+        return store()
+
+    @bp.route("/memory/<memory_id>/silo", methods=["PATCH"])
+    def move_memory_to_silo(memory_id: str) -> Any:
+        """
+        Move an existing memory to a different silo.
+        
+        Query params:
+            - target_silo: The target silo ID
+            - model_name: Model name to derive silo ID from
+        """
+        target_silo = request.args.get("target_silo") or request.args.get("model_name")
+        if not target_silo:
+            abort(400, description="'target_silo' or 'model_name' parameter required")
+        
+        target_silo_id = _normalize_silo_id(target_silo)
+        
+        graph = get_memory_graph()
+        if graph is None:
+            abort(503, description="FalkorDB is unavailable")
+        
+        try:
+            result = graph.query(
+                """
+                MATCH (m:Memory {id: $id})
+                SET m.silo_id = $silo_id
+                RETURN m
+                """,
+                {"id": memory_id, "silo_id": target_silo_id}
+            )
+            if not getattr(result, "result_set", None):
+                abort(404, description="Memory not found")
+        except Exception:
+            logger.exception("Failed to move memory to new silo")
+            abort(500, description="Failed to move memory")
+        
+        qdrant_client = get_qdrant_client()
+        if qdrant_client is not None:
+            try:
+                qdrant_client.set_payload(
+                    collection_name=collection_name,
+                    points=[memory_id],
+                    payload={"silo_id": target_silo_id}
+                )
+            except Exception:
+                logger.exception("Failed to update Qdrant for silo move")
+        
+        return jsonify({
+            "status": "success",
+            "memory_id": memory_id,
+            "silo_id": target_silo_id
+        })
 
     @bp.route("/memory/<memory_id>", methods=["PATCH"])
     def update(memory_id: str) -> Any:
@@ -425,13 +520,11 @@ def create_memory_blueprint_full(
             try:
                 selector = {"points": [memory_id]}
                 if hasattr(qdrant_client, "http"):
-                    # Try to use HTTP models selector if available
                     try:
-                        from qdrant_client.http import models as http_models  # type: ignore
-
+                        from qdrant_client.http import models as http_models
                         selector = http_models.PointIdsList(points=[memory_id])
-                    except Exception as e:
-                        logger.warning(f"Failed to import qdrant_client.http.models: {e}")
+                    except Exception:
+                        pass
                 qdrant_client.delete(collection_name=collection_name, points_selector=selector)
             except Exception:
                 logger.exception("Failed to delete vector for memory %s", memory_id)
@@ -475,7 +568,6 @@ def create_memory_blueprint_full(
             data["metadata"] = parse_metadata_field(data.get("metadata"))
             memories.append(data)
 
-        # Update last_accessed for retrieved memories
         if on_access and memories:
             accessed_ids = [str(m.get("id")) for m in memories if m.get("id")]
             if accessed_ids:
