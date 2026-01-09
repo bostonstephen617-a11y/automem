@@ -114,6 +114,7 @@ class MemoryConsolidator:
         graph: GraphLike,
         vector_store: Optional[VectorStoreProtocol] = None,
         *,
+        collection_name: str = "memories",
         delete_threshold: float = 0.05,
         archive_threshold: float = 0.2,
         grace_period_days: int = 90,
@@ -122,6 +123,7 @@ class MemoryConsolidator:
     ):
         self.graph = graph
         self.vector_store = vector_store
+        self.collection_name = str(collection_name)
         self._graph_id = id(graph)  # Unique ID for cache invalidation
 
         # Decay parameters (tunable)
@@ -587,7 +589,7 @@ class MemoryConsolidator:
                                 selector = {"points": [memory["id"]]}
 
                             self.vector_store.delete(
-                                collection_name="memories",
+                                collection_name=self.collection_name,
                                 points_selector=selector,
                             )
                             logger.info(f"Memory {memory['id']} removed from vector store")
