@@ -111,10 +111,10 @@ ENRICHMENT_ENABLE_SUMMARIES = os.getenv("ENRICHMENT_ENABLE_SUMMARIES", "true").l
 ENRICHMENT_SPACY_MODEL = os.getenv("ENRICHMENT_SPACY_MODEL", "en_core_web_sm")
 
 # Model configuration
-# text-embedding-3-large (3072d): Better semantic precision, recommended for production
-# text-embedding-3-small (768d): Cheaper, use VECTOR_SIZE=768 if switching
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
-CLASSIFICATION_MODEL = os.getenv("CLASSIFICATION_MODEL", "gpt-4o-mini")
+# qwen3-reranker-0.6b:q4k_m: Optimized reranker for memory classification
+# text-embedding-qwen3-embedding-0.6b:q8: High-quality local embeddings (3072d)
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-qwen3-embedding-0.6b:q8")
+CLASSIFICATION_MODEL = os.getenv("CLASSIFICATION_MODEL", "qwen3-reranker-0.6b:q4k_m")
 
 RECALL_RELATION_LIMIT = int(os.getenv("RECALL_RELATION_LIMIT", "5"))
 RECALL_EXPANSION_LIMIT = int(os.getenv("RECALL_EXPANSION_LIMIT", "25"))
