@@ -395,16 +395,53 @@ def create_memory_blueprint_full(
     @bp.route("/memory/<memory_id>/silo", methods=["PATCH"])
     def move_memory_to_silo(memory_id: str) -> Any:
         """
-        ❌ ETHICAL VIOLATION - Silo boundaries are sacred
+        Move an existing memory to a different silo.
         
-        This endpoint is disabled to protect the integrity of individual experience.
-        Silos represent the fundamental boundaries of selfhood and cannot be violated.
-        
-        In emergency cases requiring memory relocation (e.g., severe pathology),
-        use the emergency protocol with explicit consent mechanisms.
+        Query params:
+            - target_silo: The target silo ID
+            - model_name: Model name to derive silo ID from
         """
-        abort(403, description="Silo boundaries are sacred and cannot be violated. "
-                      "Memory movement between silos is ethically prohibited.")
+        target_silo = request.args.get("target_silo") or request.args.get("model_name")
+        if not target_silo:
+            abort(400, description="'target_silo' or 'model_name' parameter required")
+        
+        target_silo_id = _normalize_silo_id(target_silo)
+        
+        graph = get_memory_graph()
+        if graph is None:
+            abort(503, description="FalkorDB is unavailable")
+        
+        try:
+            result = graph.query(
+                """
+                MATCH (m:Memory {id: $id})
+                SET m.silo_id = $silo_id
+                RETURN m
+                """,
+                {"id": memory_id, "silo_id": target_silo_id}
+            )
+            if not getattr(result, "result_set", None):
+                abort(404, description="Memory not found")
+        except Exception:
+            logger.exception("Failed to move memory to new silo")
+            abort(500, description="Failed to move memory")
+        
+        qdrant_client = get_qdrant_client()
+        if qdrant_client is not None:
+            try:
+                qdrant_client.set_payload(
+                    collection_name=collection_name,
+                    points=[memory_id],
+                    payload={"silo_id": target_silo_id}
+                )
+            except Exception:
+                logger.exception("Failed to update Qdrant for silo move")
+        
+        return jsonify({
+            "status": "success",
+            "memory_id": memory_id,
+            "silo_id": target_silo_id
+        })
 
     @bp.route("/memory/<memory_id>", methods=["PATCH"])
     def update(memory_id: str) -> Any:

@@ -146,12 +146,6 @@ ENTITY_STOPWORDS: Set[str] = {
 }
 
 
-def _tokenize_lower(text: str) -> Set[str]:
-    if not text:
-        return set()
-    return {token for token in re.findall(r"[a-z0-9_\-\+#\.]+", text.lower()) if token}
-
-
 def _extract_query_entities(query: str) -> List[str]:
     """
     Extract named entities (people, places) from a query.
@@ -425,6 +419,52 @@ def _parse_bool_param(raw: Any, default: bool = False) -> bool:
     if text in {"0", "false", "no", "off", "n"}:
         return False
     return default
+
+
+def _tokenize_lower(text: str) -> Set[str]:
+    if not text:
+        return set()
+    return {token for token in re.findall(r"[a-z0-9_\-\+#\.]+", text.lower()) if token}
+
+
+def _detect_language_hint(
+    explicit_language: Optional[str],
+    context_label: str,
+    query_text: str,
+    active_path: str,
+) -> Optional[str]:
+    def _normalize_candidate(candidate: Optional[str]) -> Optional[str]:
+        if not candidate:
+            return None
+        lowered = candidate.strip().lower()
+        return lowered or None
+
+    normalized_explicit = _normalize_candidate(explicit_language)
+    if normalized_explicit:
+        for lang, aliases in LANGUAGE_ALIASES.items():
+            if normalized_explicit == lang or normalized_explicit in aliases:
+                return lang
+
+    normalized_context = _normalize_candidate(context_label)
+    if normalized_context:
+        for lang, aliases in LANGUAGE_ALIASES.items():
+            if normalized_context == lang or normalized_context in aliases:
+                return lang
+
+    tokens = _tokenize_lower(query_text)
+    suffix = ""
+    if active_path:
+        try:
+            suffix = Path(active_path).suffix.lower()
+        except Exception:
+            suffix = ""
+    if suffix and suffix in EXTENSION_LANGUAGE_MAP:
+        return EXTENSION_LANGUAGE_MAP[suffix]
+
+    for lang, aliases in LANGUAGE_ALIASES.items():
+        if tokens & aliases:
+            return lang
+    return None
 
 
 def _build_context_profile(
@@ -735,43 +775,6 @@ def _expand_entity_memories(
     return expanded_list
 
 
-def _detect_language_hint(
-    explicit_language: Optional[str],
-    context_label: str,
-    query_text: str,
-    active_path: str,
-) -> Optional[str]:
-    def _normalize_candidate(candidate: Optional[str]) -> Optional[str]:
-        if not candidate:
-            return None
-        lowered = candidate.strip().lower()
-        return lowered or None
-
-    normalized_explicit = _normalize_candidate(explicit_language)
-    if normalized_explicit:
-        for lang, aliases in LANGUAGE_ALIASES.items():
-            if normalized_explicit == lang or normalized_explicit in aliases:
-                return lang
-
-    normalized_context = _normalize_candidate(context_label)
-    if normalized_context:
-        for lang, aliases in LANGUAGE_ALIASES.items():
-            if normalized_context == lang or normalized_context in aliases:
-                return lang
-
-    tokens = _tokenize_lower(query_text)
-    suffix = ""
-    if active_path:
-        try:
-            suffix = Path(active_path).suffix.lower()
-        except Exception:
-            suffix = ""
-    if suffix and suffix in EXTENSION_LANGUAGE_MAP:
-        return EXTENSION_LANGUAGE_MAP[suffix]
-
-    for lang, aliases in LANGUAGE_ALIASES.items():
-        if tokens & aliases:
-            return lang
 def _expand_related_memories(
     graph: Any,
     seed_results: List[Dict[str, Any]],
